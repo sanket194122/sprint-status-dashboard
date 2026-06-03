@@ -1,0 +1,9 @@
+{
+  "name": "sprint-dashboard",
+  "description": "Real-time interactive sprint dashboard that fetches live data from JIRA and visualizes sprint progress, epic delivery risk, and team contribution with auto-refresh every 2 minutes.",
+  "version": "1.0.0",
+  "author": {
+    "name": "NICE CXone"
+  },
+  "keywords": ["sprint", "dashboard", "jira", "agile", "analytics", "epic-risk", "team-velocity", "real-time"]
+}

@@ -22,6 +22,19 @@ const GITHUB_TOKEN = process.env.GITHUB_TOKEN || '';
 const TEAMS_WEBHOOK_URL = process.env.TEAMS_WEBHOOK_URL || '';
 const HISTORY_FILE = path.join(__dirname, '..', 'data', 'sprint-history.json');
 
+// Team SM mapping: team name → people to tag for team-level alerts
+const TEAM_SM_MAP = {
+    'Titans': [
+        { name: 'Vijayaragavan Sivagurusamy', email: 'Vijayaragavan.Sivagurusamy@nice.com' },
+        { name: 'Sanket Kumar', email: 'sanket.kumar@nice.com' },
+        { name: 'Swapnil Kakade', email: 'Swapnil.Kakade@nice.com' },
+    ],
+    'Sapphire': [
+        { name: 'Yogesh Sapkal', email: 'Yogesh.Sapkal2@nice.com' },
+        { name: 'Vijayaragavan Sivagurusamy', email: 'Vijayaragavan.Sivagurusamy@nice.com' },
+    ],
+};
+
 if (!USERNAME || !TOKEN) {
     console.error('Error: Set CONFLUENCE_USERNAME and CONFLUENCE_TOKEN (or JIRA_USER and JIRA_API_TOKEN).');
     process.exit(1);
@@ -219,6 +232,7 @@ function normalizeIssues(rawIssues) {
         const category = (statusObj.statusCategory || {}).name || 'To Do';
         const assigneeObj = f.assignee;
         const assigneeName = assigneeObj ? assigneeObj.displayName || 'Unassigned' : 'Unassigned';
+        const assigneeEmail = assigneeObj ? assigneeObj.emailAddress || '' : '';
         let storyPoints = f.customfield_10038;
         if (storyPoints != null) {
             storyPoints = parseFloat(storyPoints) || 0;
@@ -231,6 +245,7 @@ function normalizeIssues(rawIssues) {
             status: statusObj.name || 'Unknown',
             statusCategory: category,
             assignee: assigneeName,
+            assigneeEmail: assigneeEmail,
             storyPoints,
             epicKey: f.customfield_10014 || null,
             issueType: (f.issuetype || {}).name || 'Task',
@@ -336,6 +351,7 @@ function computePerPerson(issues) {
 
 function computePerEpic(issues, timeProgress) {
     const epics = {};
+    const emailMap = {};
     issues.forEach(i => {
         const key = i.epicKey || 'No Epic';
         if (!epics[key]) epics[key] = { epicKey: key, epicName: key, total: 0, completed: 0, remaining: 0, contributors: {} };
@@ -344,6 +360,7 @@ function computePerEpic(issues, timeProgress) {
         else epics[key].remaining += i.storyPoints;
         const assignee = i.assignee || 'Unassigned';
         epics[key].contributors[assignee] = (epics[key].contributors[assignee] || 0) + i.storyPoints;
+        if (i.assigneeEmail) emailMap[assignee] = i.assigneeEmail;
     });
     const timePct = (timeProgress.timeElapsedPct || 0) / 100;
     return Object.values(epics)
@@ -353,8 +370,9 @@ function computePerEpic(issues, timeProgress) {
             const completionPct = e.total > 0 ? Math.round((e.completed / e.total) * 1000) / 10 : 0;
             const owner = Object.entries(e.contributors).sort((a, b) => b[1] - a[1])[0];
             const epicOwner = owner ? owner[0] : 'Unassigned';
+            const epicOwnerEmail = emailMap[epicOwner] || '';
             delete e.contributors;
-            return { ...e, riskStatus: risk.status, riskReason: risk.reason, completionPct, epicOwner };
+            return { ...e, riskStatus: risk.status, riskReason: risk.reason, completionPct, epicOwner, epicOwnerEmail };
         });
 }
 
@@ -413,7 +431,7 @@ function computeAdvancedMetrics(issues, timeProgress, sprintStart, sprintEnd) {
         const daysInProgress = Math.round((now - lastChange) / 86400000);
         i._agingDays = daysInProgress;
         return daysInProgress >= 3;
-    }).map(i => ({ key: i.key, summary: i.summary, assignee: i.assignee, points: i.storyPoints, daysStuck: i._agingDays }))
+    }).map(i => ({ key: i.key, summary: i.summary, assignee: i.assignee, assigneeEmail: i.assigneeEmail || '', points: i.storyPoints, daysStuck: i._agingDays }))
       .sort((a, b) => b.daysStuck - a.daysStuck);
 
     // #9 Availability Gap
@@ -507,9 +525,23 @@ function calculateEpicRisk(epic, timeElapsed) {
 
 // ---------- AI-Powered Risk Analysis (GitHub Models) ----------
 let aiAnalysisCache = { ts: 0, data: null };
+const AI_CACHE_TTL = 120000; // 2 min cache to avoid rate limits
+let aiRateLimitUntil = 0; // timestamp when rate limit expires
 
 async function getAIRiskAnalysis(epics, timeProgress, issues, advanced) {
     if (!GITHUB_TOKEN) return null;
+
+    // Return cached if within TTL
+    if (aiAnalysisCache.data && (Date.now() - aiAnalysisCache.ts) < AI_CACHE_TTL) {
+        console.log('  [AI] Using cached analysis (2 min TTL)');
+        return aiAnalysisCache.data;
+    }
+
+    // Skip if rate limited
+    if (Date.now() < aiRateLimitUntil) {
+        console.log(`  [AI] Rate limited, waiting ${Math.round((aiRateLimitUntil - Date.now())/1000)}s. Using cached.`);
+        return aiAnalysisCache.data;
+    }
 
     const epicSummary = epics.map(e => `- ${e.epicName||e.epicKey}: ${e.completed}/${e.total} pts done (${e.completionPct}%), owner: ${e.epicOwner}, formula risk: ${e.riskStatus}`).join('\n');
     const issueBreakdown = issues.slice(0, 60).map(i => `${i.key} [${i.statusCategory}] ${i.storyPoints}pts - ${i.assignee} - ${i.issueType}`).join('\n');
@@ -602,6 +634,11 @@ function callGitHubModels(prompt, retries = 2) {
             res.on('end', () => {
                 if (res.statusCode >= 400) {
                     console.error(`  [AI] API returned ${res.statusCode}: ${data.substring(0, 150)}`);
+                    if (res.statusCode === 429) {
+                        // Set rate limit backoff (60 seconds)
+                        aiRateLimitUntil = Date.now() + 60000;
+                        console.log('  [AI] Rate limited. Backing off 60s.');
+                    }
                     return reject(new Error(`GitHub Models API ${res.statusCode}`));
                 }
                 try {
@@ -682,7 +719,7 @@ function assessSprintHealth(summary, timeProgress) {
 const firedAlerts = new Set();
 let lastSprintId = null;
 
-function evaluateAndNotify(summary, advanced, sprint) {
+async function evaluateAndNotify(summary, advanced, sprint) {
     if (!TEAMS_WEBHOOK_URL) return;
 
     // Reset alerts if sprint changed
@@ -690,61 +727,322 @@ function evaluateAndNotify(summary, advanced, sprint) {
 
     const alerts = [];
 
-    // Rule 1: Epic Not Deliverable
+    // Rule 1: Epic Not Deliverable — tag epic owner
     (summary.perEpic || []).forEach(e => {
         if (e.riskStatus === 'Not Deliverable') {
             const key = `epic-nd-${e.epicKey}`;
-            if (!firedAlerts.has(key)) { firedAlerts.add(key); alerts.push({ title: 'Epic Not Deliverable', color: 'FF0000', facts: [{ name: 'Epic', value: `${e.epicKey} - ${e.epicName}` }, { name: 'Progress', value: `${e.completionPct}% done` }, { name: 'Owner', value: e.epicOwner || '-' }] }); }
+            if (!firedAlerts.has(key)) { firedAlerts.add(key); alerts.push({ title: 'Epic Not Deliverable', color: 'FF0000', facts: [{ name: 'Epic', value: `${e.epicKey} - ${e.epicName}` }, { name: 'Progress', value: `${e.completionPct}% done` }, { name: 'Owner', value: e.epicOwner || '-' }], mention: { name: e.epicOwner, email: e.epicOwnerEmail } }); }
         }
     });
 
-    // Rule 2: Scope Creep > 20%
+    // Rule 1b: Epic At Risk — tag epic owner
+    (summary.perEpic || []).forEach(e => {
+        if (e.riskStatus === 'At Risk') {
+            const key = `epic-risk-${e.epicKey}`;
+            if (!firedAlerts.has(key)) { firedAlerts.add(key); alerts.push({ title: 'Epic At Risk', color: 'FF9900', facts: [{ name: 'Epic', value: `${e.epicKey} - ${e.epicName}` }, { name: 'Progress', value: `${e.completionPct}% done` }, { name: 'Owner', value: e.epicOwner || '-' }], mention: { name: e.epicOwner, email: e.epicOwnerEmail } }); }
+        }
+    });
+
+    // Team SM for team-level alerts (array of people)
+    const teamSM = TEAM_SM_MAP[sprint.teamName] || [];
+
+    // Rule 2: Scope Creep > 20% — tag team SM
     if (advanced.scopeCreep && advanced.scopeCreep.pctOfSprint > 20) {
         const key = `scope-creep-${advanced.scopeCreep.pctOfSprint}`;
-        if (!firedAlerts.has(key)) { firedAlerts.add(key); alerts.push({ title: 'High Scope Creep', color: 'FF9900', facts: [{ name: 'Scope Creep', value: `${advanced.scopeCreep.pctOfSprint}% of sprint` }, { name: 'Items Added', value: `${advanced.scopeCreep.items.length} items (${advanced.scopeCreep.totalPoints} pts)` }] }); }
+        if (!firedAlerts.has(key)) { firedAlerts.add(key); alerts.push({ title: 'High Scope Creep', color: 'FF9900', facts: [{ name: 'Scope Creep', value: `${advanced.scopeCreep.pctOfSprint}% of sprint` }, { name: 'Items Added', value: `${advanced.scopeCreep.items.length} items (${advanced.scopeCreep.totalPoints} pts)` }], mention: teamSM }); }
     }
 
-    // Rule 3: Items stuck 5+ days
+    // Rule 3: Items stuck 5+ days — tag the assignee
     const stuckItems = (advanced.agingWIP || []).filter(i => i.daysStuck >= 5);
     stuckItems.forEach(i => {
         const key = `stuck-${i.key}`;
-        if (!firedAlerts.has(key)) { firedAlerts.add(key); alerts.push({ title: 'Item Stuck 5+ Days', color: 'CC0000', facts: [{ name: 'Issue', value: `${i.key} - ${i.summary}` }, { name: 'Stuck For', value: `${i.daysStuck} days` }, { name: 'Assignee', value: i.assignee }] }); }
+        if (!firedAlerts.has(key)) { firedAlerts.add(key); alerts.push({ title: 'Item Stuck 5+ Days', color: 'CC0000', facts: [{ name: 'Issue', value: `${i.key} - ${i.summary}` }, { name: 'Stuck For', value: `${i.daysStuck} days` }, { name: 'Assignee', value: i.assignee }], mention: { name: i.assignee, email: i.assigneeEmail } }); }
     });
 
-    // Rule 4: Sprint forecast > 2 days late
+    // Rule 4: Sprint forecast > 2 days late — tag team SM
     if (advanced.forecast && advanced.forecast.forecastDelta < -2) {
         const key = `forecast-late`;
-        if (!firedAlerts.has(key)) { firedAlerts.add(key); alerts.push({ title: 'Sprint Forecast: Behind Schedule', color: 'FF3300', facts: [{ name: 'Forecast', value: advanced.forecast.message }, { name: 'Daily Velocity', value: `${advanced.forecast.dailyVelocity} pts/day` }] }); }
+        if (!firedAlerts.has(key)) { firedAlerts.add(key); alerts.push({ title: 'Sprint Forecast: Behind Schedule', color: 'FF3300', facts: [{ name: 'Forecast', value: advanced.forecast.message }, { name: 'Daily Velocity', value: `${advanced.forecast.dailyVelocity} pts/day` }], mention: teamSM }); }
     }
 
-    // Rule 5: Unassigned work > 10 pts
+    // Rule 5: Unassigned work > 10 pts — tag team SM
     if (advanced.unassigned && advanced.unassigned.totalPoints > 10) {
         const key = `unassigned-${advanced.unassigned.totalPoints}`;
-        if (!firedAlerts.has(key)) { firedAlerts.add(key); alerts.push({ title: 'Unassigned Work Detected', color: '0066FF', facts: [{ name: 'Unassigned Points', value: `${advanced.unassigned.totalPoints} pts` }, { name: 'Items', value: `${advanced.unassigned.items.length} issues without assignee` }] }); }
+        if (!firedAlerts.has(key)) { firedAlerts.add(key); alerts.push({ title: 'Unassigned Work Detected', color: '0066FF', facts: [{ name: 'Unassigned Points', value: `${advanced.unassigned.totalPoints} pts` }, { name: 'Items', value: `${advanced.unassigned.items.length} issues without assignee` }], mention: teamSM }); }
     }
 
-    // Send all alerts
-    alerts.forEach(a => sendTeamsCard(a.title, a.facts, a.color, sprint));
+    // Batch generate unique witty messages in ONE API call
+    if (alerts.length === 0) return;
+    const batchMessages = await generateWittyBatch(alerts);
+
+    // Send all alerts with unique messages
+    for (let i = 0; i < alerts.length; i++) {
+        const a = alerts[i];
+        const wittyOverride = batchMessages && batchMessages[i] ? batchMessages[i] : null;
+        await sendTeamsCardWithWitty(a.title, a.facts, a.color, sprint, a.mention || null, wittyOverride);
+    }
 }
 
-function sendTeamsCard(title, facts, color, sprint) {
+// Fallback witty messages (used when AI is unavailable)
+const WITTY_FALLBACK = {
+    'Epic Not Deliverable': [
+        "Houston, we have a problem. This epic isn't going to make it. 🚀💥",
+        "This epic just called in sick for the rest of the sprint.",
+        "Plot twist: this epic decided it belongs in the next sprint.",
+        "This epic is moving at the speed of a Monday morning standup.",
+    ],
+    'Epic At Risk': [
+        "This epic is sweating more than a developer during a prod deploy. 😅",
+        "Warning: This epic is running on hopes and prayers.",
+        "This epic needs a coffee... and maybe a miracle. ☕",
+        "If this epic were a movie, we'd be at the suspense scene.",
+    ],
+    'High Scope Creep': [
+        "Scope creep alert! Someone's been sneaking items in like it's Black Friday. 🛒",
+        "The sprint backlog is growing faster than a Slack thread.",
+        "Who ordered extra scope? Nobody? Thought so. 🤷",
+        "Sprint scope expanding like a developer's estimate of 'just 2 hours'.",
+    ],
+    'Item Stuck': [
+        "This ticket hasn't moved in so long it's paying rent. 🏠",
+        "Is this ticket on vacation? Asking for the sprint goal.",
+        "This item is stuck longer than my last Windows update.",
+        "Day 5: The ticket still hasn't moved. Send help. 🆘",
+    ],
+    'Sprint Forecast: Behind Schedule': [
+        "At this velocity, the sprint will finish... eventually. ⏳",
+        "The burndown chart is looking more like a flat line. 📉",
+        "Sprint goal watching the team like: 👀",
+        "We're behind schedule. Time to cancel some meetings and actually code.",
+    ],
+    'Unassigned Work Detected': [
+        "These orphan tickets are looking for a loving developer. 🥺",
+        "Unassigned work detected. It won't do itself... or will it? 🤖",
+        "These tickets are like gym memberships — someone signed up but nobody's showing up.",
+        "Free tickets! No takers? Anyone? Bueller? 🎬",
+    ],
+};
+
+function getFallbackWitty(alertTitle) {
+    const key = Object.keys(WITTY_FALLBACK).find(k => alertTitle.toLowerCase().includes(k.toLowerCase())) || '';
+    const messages = WITTY_FALLBACK[key] || ["Attention needed! Time to take action. 👀"];
+    return messages[Math.floor(Math.random() * messages.length)];
+}
+
+// Track used fallbacks to avoid repeats in same batch
+let usedFallbacks = new Set();
+
+function getFallbackWittyUnique(alertTitle) {
+    const key = Object.keys(WITTY_FALLBACK).find(k => alertTitle.toLowerCase().includes(k.toLowerCase())) || '';
+    const messages = WITTY_FALLBACK[key] || ["Attention needed! Time to take action. 👀"];
+    const available = messages.filter(m => !usedFallbacks.has(m));
+    const pick = available.length > 0 ? available[Math.floor(Math.random() * available.length)] : messages[Math.floor(Math.random() * messages.length)];
+    usedFallbacks.add(pick);
+    if (usedFallbacks.size > 20) usedFallbacks.clear();
+    return pick;
+}
+
+// Batch witty message generation — generates multiple unique messages in one API call
+let wittyBatchCache = { ts: 0, messages: [] };
+
+async function generateWittyBatch(alerts) {
+    if (!GITHUB_TOKEN || Date.now() < aiRateLimitUntil) return null;
+    if (wittyBatchCache.messages.length >= alerts.length && (Date.now() - wittyBatchCache.ts) < 30000) return wittyBatchCache.messages;
+
+    const alertList = alerts.map((a, i) => `${i+1}. Alert: "${a.title}" | Context: ${a.facts.map(f => f.name+': '+f.value).join(', ')}`).join('\n');
+    const prompt = `Generate ${alerts.length} UNIQUE witty/funny notification messages for these sprint alerts. Each must be different, creative, and under 15 words.
+
+${alertList}
+
+Rules:
+- Each message must be COMPLETELY different from the others
+- Be funny, sarcastic, use pop culture references, or tech humor
+- Use 1-2 emojis per message
+- Never repeat the same joke structure
+- Mix styles: movie quotes, memes, sarcasm, puns, dad jokes
+
+Respond with ONLY a JSON array of strings, one per alert:
+["message 1", "message 2", ...]`;
+
+    try {
+        const body = JSON.stringify({ model: 'gpt-4o', messages: [{ role: 'user', content: prompt }], temperature: 1.2, max_tokens: 300 });
+        const result = await new Promise((resolve, reject) => {
+            const req = https.request({ hostname: 'models.inference.ai.azure.com', port: 443, path: '/chat/completions', method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${GITHUB_TOKEN}`, 'Content-Length': Buffer.byteLength(body) } }, (res) => {
+                let d = ''; res.on('data', c => d += c);
+                res.on('end', () => {
+                    if (res.statusCode === 429) { aiRateLimitUntil = Date.now() + 60000; return reject(new Error('rate limited')); }
+                    if (res.statusCode >= 400) return reject(new Error(`API ${res.statusCode}`));
+                    try {
+                        const p = JSON.parse(d);
+                        const text = p.choices[0].message.content.trim();
+                        const match = text.match(/\[[\s\S]*\]/);
+                        if (match) resolve(JSON.parse(match[0]));
+                        else reject(new Error('no array'));
+                    } catch (e) { reject(e); }
+                });
+            });
+            req.on('error', reject);
+            req.setTimeout(12000, () => { req.destroy(); reject(new Error('timeout')); });
+            req.write(body); req.end();
+        });
+        console.log(`  [AI Witty] Generated ${result.length} unique messages`);
+        wittyBatchCache = { ts: Date.now(), messages: result };
+        return result;
+    } catch (e) {
+        console.log(`  [AI Witty Batch] Failed: ${e.message}`);
+        return null;
+    }
+}
+
+async function getWittyMessage(alertTitle, facts, batchIndex, batchMessages) {
+    // If batch messages available, use them
+    if (batchMessages && batchMessages[batchIndex]) return batchMessages[batchIndex];
+
+    // Single message generation
+    if (!GITHUB_TOKEN || Date.now() < aiRateLimitUntil) return getFallbackWittyUnique(alertTitle);
+    try {
+        const context = facts.map(f => `${f.name}: ${f.value}`).join(', ');
+        const prompt = `Generate ONE short witty/funny notification message (max 15 words) for a sprint alert.
+Alert type: "${alertTitle}"
+Context: ${context}
+
+Rules: Be funny/sarcastic, use pop culture or tech humor, 1-2 emojis, MUST be unique and creative. Respond with ONLY the message.`;
+
+        const body = JSON.stringify({ model: 'gpt-4o', messages: [{ role: 'user', content: prompt }], temperature: 1.2, max_tokens: 50 });
+        const result = await new Promise((resolve, reject) => {
+            const req = https.request({ hostname: 'models.inference.ai.azure.com', port: 443, path: '/chat/completions', method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${GITHUB_TOKEN}`, 'Content-Length': Buffer.byteLength(body) } }, (res) => {
+                let d = ''; res.on('data', c => d += c);
+                res.on('end', () => {
+                    if (res.statusCode === 429) { aiRateLimitUntil = Date.now() + 60000; return reject(new Error('rate limited')); }
+                    if (res.statusCode >= 400) return reject(new Error('AI failed'));
+                    try { const p = JSON.parse(d); resolve(p.choices[0].message.content.trim().replace(/^["']|["']$/g, '')); } catch (e) { reject(e); }
+                });
+            });
+            req.on('error', reject);
+            req.setTimeout(8000, () => { req.destroy(); reject(new Error('timeout')); });
+            req.write(body); req.end();
+        });
+        console.log(`  [AI Witty] "${result}"`);
+        return result;
+    } catch (e) {
+        console.log(`  [AI Witty] Fallback (${e.message})`);
+        return getFallbackWittyUnique(alertTitle);
+    }
+}
+
+async function sendTeamsCardWithWitty(title, facts, color, sprint, mention, wittyOverride) {
+    const witty = wittyOverride || getFallbackWittyUnique(title);
+    return _sendTeamsCardInner(title, facts, color, sprint, mention, witty);
+}
+
+async function sendTeamsCard(title, facts, color, sprint, mention) {
+    const witty = await getWittyMessage(title, facts, 0, null);
+    return _sendTeamsCardInner(title, facts, color, sprint, mention, witty);
+}
+
+function _sendTeamsCardInner(title, facts, color, sprint, mention, witty) {
+    // mention can be a single object or an array of objects
+    const mentions = Array.isArray(mention) ? mention : (mention ? [mention] : []);
+    const mentionText = mentions.filter(m => m.name).map(m => `<at>${m.name}</at>`).join(', ');
+    const mentionEntity = mentions.filter(m => m.name && m.email).map(m => ({
+        "type": "mention",
+        "text": `<at>${m.name}</at>`,
+        "mentioned": { "id": m.email, "name": m.name }
+    }));
+    const alertColor = color === 'FF0000' || color === 'CC0000' || color === 'FF3300' ? 'Attention' : color === 'FF9900' ? 'Warning' : 'Accent';
+    const emoji = alertColor === 'Attention' ? '🔴' : alertColor === 'Warning' ? '🟠' : '🔵';
+
+    const bodyItems = [
+        {
+            "type": "Container",
+            "style": alertColor === 'Attention' ? 'attention' : alertColor === 'Warning' ? 'warning' : 'accent',
+            "bleed": true,
+            "items": [
+                {
+                    "type": "TextBlock",
+                    "text": `${emoji} SPRINT ALERT`,
+                    "weight": "Bolder",
+                    "size": "Small",
+                    "color": alertColor,
+                    "spacing": "None"
+                },
+                {
+                    "type": "TextBlock",
+                    "text": title,
+                    "weight": "Bolder",
+                    "size": "Large",
+                    "wrap": true,
+                    "spacing": "Small"
+                }
+            ]
+        },
+        {
+            "type": "TextBlock",
+            "text": `💬 _${witty}_`,
+            "wrap": true,
+            "size": "Medium",
+            "spacing": "Medium"
+        },
+        {
+            "type": "ColumnSet",
+            "separator": true,
+            "spacing": "Medium",
+            "columns": [{
+                "type": "Column",
+                "width": "stretch",
+                "items": [{
+                    "type": "FactSet",
+                    "facts": facts.map(f => ({ "title": f.name, "value": `**${f.value}**` }))
+                }]
+            }]
+        },
+        {
+            "type": "TextBlock",
+            "text": `📋 Sprint: **${sprint.name}** | Team: **${sprint.teamName}**`,
+            "size": "Small",
+            "isSubtle": true,
+            "separator": true,
+            "spacing": "Medium",
+            "wrap": true
+        }
+    ];
+
+    if (mentionText) {
+        bodyItems.push({
+            "type": "TextBlock",
+            "text": `⚡ **Action Required:** ${mentionText}`,
+            "weight": "Bolder",
+            "size": "Medium",
+            "color": alertColor,
+            "spacing": "Medium",
+            "wrap": true
+        });
+    }
+
     const card = {
-        "@type": "MessageCard",
-        "@context": "http://schema.org/extensions",
-        "themeColor": color,
-        "title": `🚨 ${title}`,
-        "sections": [{
-            "activityTitle": `Sprint: ${sprint.name} | Team: ${sprint.teamName}`,
-            "facts": facts
+        "type": "message",
+        "attachments": [{
+            "contentType": "application/vnd.microsoft.card.adaptive",
+            "content": {
+                "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+                "type": "AdaptiveCard",
+                "version": "1.5",
+                "body": bodyItems,
+                "msteams": mentionEntity.length > 0 ? { "entities": mentionEntity } : undefined
+            }
         }]
     };
+
     const body = JSON.stringify(card);
     try {
         const parsed = new URL(TEAMS_WEBHOOK_URL);
         const req = https.request({ hostname: parsed.hostname, port: 443, path: parsed.pathname + parsed.search, method: 'POST', headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) } }, (res) => {
-            if (res.statusCode >= 400) console.error(`  [Teams] Alert failed: ${res.statusCode}`);
-            else console.log(`  [Teams] Alert sent: ${title}`);
-            res.resume();
+            let respBody = '';
+            res.on('data', c => respBody += c);
+            res.on('end', () => {
+                if (res.statusCode >= 400) console.error(`  [Teams] Alert failed: ${res.statusCode} - ${respBody.substring(0, 150)}`);
+                else console.log(`  [Teams] Alert sent: ${title} → ${mentions.length ? mentions.map(m=>m.name).join(', ') : 'channel'}`);
+            });
         });
         req.on('error', e => console.error(`  [Teams] Error: ${e.message}`));
         req.write(body);
@@ -945,9 +1243,8 @@ const server = http.createServer(async (req, res) => {
             const aiForecastInsight = aiAnalysis && typeof aiAnalysis.forecastInsight === 'string' ? aiAnalysis.forecastInsight : null;
             const aiRiskSummary = aiAnalysis && typeof aiAnalysis.riskSummary === 'string' ? aiAnalysis.riskSummary : null;
 
-            // Teams notifications (fire-and-forget)
+            // Teams notifications only via manual buttons (not auto-refresh)
             const sprintMeta = { id: sprint.id, name: sprint.name, teamName, projectKey };
-            evaluateAndNotify(summary, advanced, sprintMeta);
 
             // Save sprint snapshot for history
             saveSprintSnapshot(sprint, summary, advanced, projectKey, teamName);
@@ -979,6 +1276,42 @@ const server = http.createServer(async (req, res) => {
             const teamName = query.team || TEAM_NAME;
             const history = getSprintHistory(projectKey, teamName);
             sendJSON(res, { history });
+            return;
+        }
+
+        // Alert all — triggers all pending alerts
+        if (pathname === '/api/alert-all' && req.method === 'POST') {
+            const projectKey = query.project || PROJECT_KEY;
+            const teamName = query.team || TEAM_NAME;
+            const sprintName = query.sprint || SPRINT_NAME;
+            try {
+                const sprint = await ensureSprint(projectKey, sprintName);
+                const issues = await getSprintIssues(sprint.id, projectKey, teamName);
+                issues.forEach(i => { i.epicName = i.epicKey || 'No Epic'; });
+                const timeProgress = computeTimeProgress(sprint.startDate, sprint.endDate);
+                const summary = computeSummary(issues, timeProgress);
+                const advanced = computeAdvancedMetrics(issues, timeProgress, sprint.startDate, sprint.endDate);
+                const sprintMeta = { id: sprint.id, name: sprint.name, teamName, projectKey };
+                firedAlerts.clear();
+                evaluateAndNotify(summary, advanced, sprintMeta);
+                sendJSON(res, { status: 'alerts triggered', alertCount: firedAlerts.size });
+            } catch (e) {
+                res.writeHead(500); res.end(JSON.stringify({ error: e.message }));
+            }
+            return;
+        }
+
+        // Manual alert trigger from UI (single item)
+        if (pathname === '/api/alert' && req.method === 'POST') {
+            let body = '';
+            req.on('data', c => body += c);
+            req.on('end', () => {
+                try {
+                    const { title, facts, color, mention, sprint: sprintInfo } = JSON.parse(body);
+                    sendTeamsCard(title, facts, color || 'FF9900', sprintInfo || { name: SPRINT_NAME, teamName: TEAM_NAME }, mention || null);
+                    sendJSON(res, { status: 'alert sent' });
+                } catch (e) { res.writeHead(400); res.end(JSON.stringify({ error: e.message })); }
+            });
             return;
         }
 

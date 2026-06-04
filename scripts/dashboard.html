@@ -344,6 +344,59 @@
         .alert-dot-blue { background: var(--accent); }
         .alert-key { font-weight: 600; color: var(--accent); white-space: nowrap; }
         .alert-meta { color: var(--text-tertiary); margin-left: auto; white-space: nowrap; font-weight: 500; }
+        .alert-item-btn {
+            width: 24px; height: 24px; border-radius: 6px; border: 1px solid var(--border);
+            background: transparent; color: var(--text-secondary); font-size: 12px;
+            cursor: pointer; display: inline-flex; align-items: center; justify-content: center;
+            transition: all 0.2s ease; flex-shrink: 0; margin-left: 4px;
+        }
+        .alert-item-btn:hover { border-color: var(--accent); color: var(--accent); background: rgba(167,139,250,0.05); transform: scale(1.1); }
+        .alert-item-btn:disabled { opacity: 0.4; transform: none; cursor: default; }
+
+        /* Modal */
+        .modal-overlay {
+            position: fixed; inset: 0; z-index: 9999;
+            background: rgba(0,0,0,0.6);
+            backdrop-filter: blur(6px);
+            -webkit-backdrop-filter: blur(6px);
+            display: flex; align-items: center; justify-content: center;
+            animation: modalFadeIn 0.2s ease;
+        }
+        @keyframes modalFadeIn { from { opacity: 0; } to { opacity: 1; } }
+        @keyframes modalSlideUp { from { opacity: 0; transform: translateY(20px) scale(0.95); } to { opacity: 1; transform: translateY(0) scale(1); } }
+        .modal-card {
+            background: var(--bg-card-solid, #131316);
+            border: 1px solid var(--border);
+            border-radius: 20px;
+            padding: 32px;
+            max-width: 400px;
+            width: 90%;
+            animation: modalSlideUp 0.3s cubic-bezier(0.16,1,0.3,1);
+            text-align: center;
+        }
+        .modal-icon { font-size: 36px; margin-bottom: 12px; }
+        .modal-title { font-size: 18px; font-weight: 700; color: var(--text); margin-bottom: 10px; }
+        .modal-desc { font-size: 13px; color: var(--text-secondary); line-height: 1.6; }
+        .modal-list {
+            text-align: left;
+            list-style: none;
+            margin: 14px 0;
+            padding: 14px 16px;
+            background: rgba(255,255,255,0.03);
+            border: 1px solid var(--border);
+            border-radius: 10px;
+        }
+        .modal-list li { font-size: 12px; color: var(--text-secondary); padding: 5px 0; padding-left: 16px; position: relative; }
+        .modal-list li::before { content: '•'; position: absolute; left: 0; color: var(--accent); font-weight: bold; }
+        .modal-actions { display: flex; gap: 10px; margin-top: 20px; }
+        .modal-btn {
+            flex: 1; padding: 11px 16px; border-radius: 10px; font-size: 13px; font-weight: 600;
+            cursor: pointer; transition: all 0.2s ease; font-family: inherit; border: none;
+        }
+        .modal-btn-cancel { background: var(--card-highlight); color: var(--text-secondary); border: 1px solid var(--border); }
+        .modal-btn-cancel:hover { background: var(--border); color: var(--text); }
+        .modal-btn-confirm { background: linear-gradient(135deg, var(--accent), var(--accent-secondary)); color: #fff; }
+        .modal-btn-confirm:hover { transform: translateY(-1px); box-shadow: 0 4px 16px rgba(167,139,250,0.3); }
 
         .scorecard { display: grid; grid-template-columns: auto 1fr; gap: 20px; align-items: center; }
         .scorecard-grade { font-size: 64px; font-weight: 700; letter-spacing: -2px; line-height: 1; }
@@ -519,6 +572,7 @@
                 <select id="selSprint"><option value="">--</option></select>
             </div>
             <button class="sel-btn" id="btnApply" onclick="applySelection()">Go</button>
+            <button class="sel-btn" id="alertAllBtn" onclick="alertAll()" style="background:linear-gradient(135deg,#f87171,#fbbf24);">🔔 Alert Team</button>
         </div>
 
         <!-- Loading -->
@@ -716,6 +770,25 @@
         </div>
     </div>
 
+    <!-- Confirmation Modal -->
+    <div class="modal-overlay" id="confirmModal" style="display:none;">
+        <div class="modal-card">
+            <div class="modal-icon">🔔</div>
+            <h3 class="modal-title">Alert Team</h3>
+            <p class="modal-desc">This will send notifications to your Teams channel for all active sprint alerts:</p>
+            <ul class="modal-list">
+                <li>At-risk & not-deliverable epics</li>
+                <li>Items stuck for 5+ days</li>
+                <li>Scope creep, forecast & unassigned work</li>
+            </ul>
+            <p class="modal-desc" style="margin-top:12px;color:var(--text-tertiary);font-size:11px;">Team members will be @mentioned based on ownership.</p>
+            <div class="modal-actions">
+                <button class="modal-btn modal-btn-cancel" onclick="closeModal()">Cancel</button>
+                <button class="modal-btn modal-btn-confirm" onclick="confirmAlertAll()">Send Alerts</button>
+            </div>
+        </div>
+    </div>
+
     <script>
         const REFRESH_INTERVAL = 300000;
         let donutChart = null, barChart = null, countdownTimer = null, countdownValue = 300, allIssues = [];
@@ -906,10 +979,12 @@
             document.getElementById('epicTableBody').innerHTML = epics.map(e => {
                 const riskLabel = e.aiRisk || e.riskStatus;
                 const insight = e.aiInsight || e.riskReason;
+                const showAlert = riskLabel === 'At Risk' || riskLabel === 'Not Deliverable';
+                const alertBtn = showAlert ? `<button class="alert-item-btn" onclick="alertOne('Epic ${riskLabel}: ${e.epicKey}', [{name:'Epic',value:'${(e.epicName||e.epicKey).replace(/'/g,"")}'},{name:'Progress',value:'${e.completionPct}% done'},{name:'Owner',value:'${(e.epicOwner||'-').replace(/'/g,"")}'}], '${(e.epicOwner||'').replace(/'/g,"")}', '${e.epicOwnerEmail||''}')">🔔</button>` : '';
                 return `<tr>
                 <td><strong>${e.epicName||e.epicKey}</strong></td><td>${e.epicOwner||'-'}</td><td>${e.total}</td><td>${e.completed}</td><td>${e.remaining}</td>
                 <td><div class="prog-cell"><div class="prog-bar"><div class="prog-fill" style="width:${e.completionPct}%"></div></div><span class="prog-text">${e.completionPct}%</span></div></td>
-                <td><span class="badge ${badgeClass(riskLabel)}">${riskLabel}</span></td>
+                <td><span class="badge ${badgeClass(riskLabel)}">${riskLabel}</span> ${alertBtn}</td>
                 <td class="ai-cell">${insight}</td></tr>`;
             }).join('');
         }
@@ -1002,7 +1077,7 @@
             document.getElementById('agingCount').textContent = adv.agingWIP.length > 0 ? `(${adv.agingWIP.length})` : '';
             document.getElementById('agingList').innerHTML = adv.agingWIP.length === 0
                 ? '<li class="alert-item" style="color:var(--text-tertiary)">No aging items - looking good!</li>'
-                : adv.agingWIP.slice(0, 8).map(i => `<li class="alert-item"><span class="alert-dot alert-dot-red"></span><span class="alert-key">${i.key}</span><span>${i.summary.substring(0,40)}${i.summary.length>40?'...':''}</span><span class="alert-meta">${i.daysStuck}d stuck &middot; ${i.assignee}</span></li>`).join('');
+                : adv.agingWIP.slice(0, 8).map(i => `<li class="alert-item"><span class="alert-dot alert-dot-red"></span><span class="alert-key">${i.key}</span><span>${i.summary.substring(0,35)}${i.summary.length>35?'...':''}</span><span class="alert-meta">${i.daysStuck}d &middot; ${i.assignee}</span><button class="alert-item-btn" onclick="alertOne('Item Stuck ${i.daysStuck} Days: ${i.key}', [{name:'Issue',value:'${i.key} - ${i.summary.substring(0,30).replace(/'/g,"")}'},{name:'Stuck',value:'${i.daysStuck} days'},{name:'Assignee',value:'${i.assignee.replace(/'/g,"")}'}], '${i.assignee.replace(/'/g,"")}', '${i.assigneeEmail||''}')">🔔</button></li>`).join('');
 
             // Carry-Over Risk (#3)
             document.getElementById('carryCount').textContent = adv.carryOverRisk.length > 0 ? `(${adv.carryOverRisk.length})` : '';
@@ -1112,6 +1187,41 @@
             await fetch('/api/refresh', { method: 'POST' });
             countdownValue = 300;
             fetchAll();
+        }
+
+        // Alert functions
+        async function alertOne(title, facts, mentionName, mentionEmail) {
+            const btn = event.target;
+            btn.disabled = true; btn.textContent = 'Sending...';
+            const sprint = { name: currentSprint, teamName: currentTeam };
+            const mention = mentionName ? { name: mentionName, email: mentionEmail } : null;
+            try {
+                await fetch('/api/alert', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ title, facts, color: 'FF9900', mention, sprint }) });
+                btn.textContent = '✓ Sent';
+                setTimeout(() => { btn.textContent = '🔔'; btn.disabled = false; }, 3000);
+            } catch (e) { btn.textContent = '✗ Failed'; btn.disabled = false; }
+        }
+
+        function alertAll() {
+            document.getElementById('confirmModal').style.display = 'flex';
+        }
+        function closeModal() {
+            document.getElementById('confirmModal').style.display = 'none';
+        }
+        async function confirmAlertAll() {
+            closeModal();
+            const btn = document.getElementById('alertAllBtn');
+            btn.disabled = true; btn.textContent = 'Sending...';
+            const params = new URLSearchParams();
+            if (currentProject) params.set('project', currentProject);
+            if (currentTeam) params.set('team', currentTeam);
+            if (currentSprint) params.set('sprint', currentSprint);
+            try {
+                const resp = await fetch(`/api/alert-all?${params}`, { method: 'POST' });
+                const data = await resp.json();
+                btn.textContent = `✓ ${data.alertCount || 0} Alerts Sent`;
+            } catch (e) { btn.textContent = '✗ Failed'; }
+            setTimeout(() => { btn.textContent = '🔔 Alert Team'; btn.disabled = false; }, 4000);
         }
 
         // Countdown

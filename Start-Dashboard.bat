@@ -7,12 +7,9 @@ echo   Sprint Status Dashboard
 echo   =======================
 echo.
 
-:: Check if GITHUB_TOKEN is set for AI features
-if defined GITHUB_TOKEN (
-    echo   AI Risk Analysis: Enabled
-) else (
-    echo   AI Risk Analysis: Disabled (set GITHUB_TOKEN env var to enable)
-)
+:: Check if tokens are set (set them via environment variables)
+if defined GITHUB_TOKEN (echo   AI Risk Analysis: Enabled) else (echo   AI Risk Analysis: Disabled - set GITHUB_TOKEN env var)
+if defined TEAMS_WEBHOOK_URL (echo   Teams Alerts: Enabled) else (echo   Teams Alerts: Disabled - set TEAMS_WEBHOOK_URL env var)
 echo.
 
 timeout /t 2 /nobreak >nul

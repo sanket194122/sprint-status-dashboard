@@ -505,11 +505,9 @@ function calculateEpicRisk(epic, timeElapsed) {
 
 // ---------- AI-Powered Risk Analysis (GitHub Models) ----------
 let aiAnalysisCache = { ts: 0, data: null };
-const AI_CACHE_TTL = 600000; // 10 min
 
 async function getAIRiskAnalysis(epics, timeProgress, issues, advanced) {
     if (!GITHUB_TOKEN) return null;
-    if (aiAnalysisCache.data && (Date.now() - aiAnalysisCache.ts) < AI_CACHE_TTL) return aiAnalysisCache.data;
 
     const epicSummary = epics.map(e => `- ${e.epicName||e.epicKey}: ${e.completed}/${e.total} pts done (${e.completionPct}%), owner: ${e.epicOwner}, formula risk: ${e.riskStatus}`).join('\n');
     const issueBreakdown = issues.slice(0, 60).map(i => `${i.key} [${i.statusCategory}] ${i.storyPoints}pts - ${i.assignee} - ${i.issueType}`).join('\n');

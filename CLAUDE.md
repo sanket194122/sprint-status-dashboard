@@ -71,6 +71,7 @@ Node.js server (server.js, port 8501)
 | CONFLUENCE_USERNAME | Yes | Atlassian email |
 | CONFLUENCE_TOKEN | Yes | Atlassian API token |
 | GITHUB_TOKEN | No | GitHub PAT for AI features |
+| TEAMS_WEBHOOK_URL | No | MS Teams incoming webhook for alerts |
 | PROJECT_KEY | No | Default project (CXDV) |
 | TEAM_NAME | No | Default team (Titans) |
 | SPRINT_NAME | No | Default sprint (CX.26.3.191) |

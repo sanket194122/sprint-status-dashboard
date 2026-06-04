@@ -19,6 +19,8 @@ const PROJECT_KEY = process.env.PROJECT_KEY || 'CXDV';
 const PORT = parseInt(process.env.DASHBOARD_PORT || '8501', 10);
 const CACHE_TTL_MS = 300000;
 const GITHUB_TOKEN = process.env.GITHUB_TOKEN || '';
+const TEAMS_WEBHOOK_URL = process.env.TEAMS_WEBHOOK_URL || '';
+const HISTORY_FILE = path.join(__dirname, '..', 'data', 'sprint-history.json');
 
 if (!USERNAME || !TOKEN) {
     console.error('Error: Set CONFLUENCE_USERNAME and CONFLUENCE_TOKEN (or JIRA_USER and JIRA_API_TOKEN).');
@@ -676,6 +678,125 @@ function assessSprintHealth(summary, timeProgress) {
     return { status, reasons, score: Math.max(score, 0) };
 }
 
+// ---------- Teams Notifications ----------
+const firedAlerts = new Set();
+let lastSprintId = null;
+
+function evaluateAndNotify(summary, advanced, sprint) {
+    if (!TEAMS_WEBHOOK_URL) return;
+
+    // Reset alerts if sprint changed
+    if (sprint.id !== lastSprintId) { firedAlerts.clear(); lastSprintId = sprint.id; }
+
+    const alerts = [];
+
+    // Rule 1: Epic Not Deliverable
+    (summary.perEpic || []).forEach(e => {
+        if (e.riskStatus === 'Not Deliverable') {
+            const key = `epic-nd-${e.epicKey}`;
+            if (!firedAlerts.has(key)) { firedAlerts.add(key); alerts.push({ title: 'Epic Not Deliverable', color: 'FF0000', facts: [{ name: 'Epic', value: `${e.epicKey} - ${e.epicName}` }, { name: 'Progress', value: `${e.completionPct}% done` }, { name: 'Owner', value: e.epicOwner || '-' }] }); }
+        }
+    });
+
+    // Rule 2: Scope Creep > 20%
+    if (advanced.scopeCreep && advanced.scopeCreep.pctOfSprint > 20) {
+        const key = `scope-creep-${advanced.scopeCreep.pctOfSprint}`;
+        if (!firedAlerts.has(key)) { firedAlerts.add(key); alerts.push({ title: 'High Scope Creep', color: 'FF9900', facts: [{ name: 'Scope Creep', value: `${advanced.scopeCreep.pctOfSprint}% of sprint` }, { name: 'Items Added', value: `${advanced.scopeCreep.items.length} items (${advanced.scopeCreep.totalPoints} pts)` }] }); }
+    }
+
+    // Rule 3: Items stuck 5+ days
+    const stuckItems = (advanced.agingWIP || []).filter(i => i.daysStuck >= 5);
+    stuckItems.forEach(i => {
+        const key = `stuck-${i.key}`;
+        if (!firedAlerts.has(key)) { firedAlerts.add(key); alerts.push({ title: 'Item Stuck 5+ Days', color: 'CC0000', facts: [{ name: 'Issue', value: `${i.key} - ${i.summary}` }, { name: 'Stuck For', value: `${i.daysStuck} days` }, { name: 'Assignee', value: i.assignee }] }); }
+    });
+
+    // Rule 4: Sprint forecast > 2 days late
+    if (advanced.forecast && advanced.forecast.forecastDelta < -2) {
+        const key = `forecast-late`;
+        if (!firedAlerts.has(key)) { firedAlerts.add(key); alerts.push({ title: 'Sprint Forecast: Behind Schedule', color: 'FF3300', facts: [{ name: 'Forecast', value: advanced.forecast.message }, { name: 'Daily Velocity', value: `${advanced.forecast.dailyVelocity} pts/day` }] }); }
+    }
+
+    // Rule 5: Unassigned work > 10 pts
+    if (advanced.unassigned && advanced.unassigned.totalPoints > 10) {
+        const key = `unassigned-${advanced.unassigned.totalPoints}`;
+        if (!firedAlerts.has(key)) { firedAlerts.add(key); alerts.push({ title: 'Unassigned Work Detected', color: '0066FF', facts: [{ name: 'Unassigned Points', value: `${advanced.unassigned.totalPoints} pts` }, { name: 'Items', value: `${advanced.unassigned.items.length} issues without assignee` }] }); }
+    }
+
+    // Send all alerts
+    alerts.forEach(a => sendTeamsCard(a.title, a.facts, a.color, sprint));
+}
+
+function sendTeamsCard(title, facts, color, sprint) {
+    const card = {
+        "@type": "MessageCard",
+        "@context": "http://schema.org/extensions",
+        "themeColor": color,
+        "title": `🚨 ${title}`,
+        "sections": [{
+            "activityTitle": `Sprint: ${sprint.name} | Team: ${sprint.teamName}`,
+            "facts": facts
+        }]
+    };
+    const body = JSON.stringify(card);
+    try {
+        const parsed = new URL(TEAMS_WEBHOOK_URL);
+        const req = https.request({ hostname: parsed.hostname, port: 443, path: parsed.pathname + parsed.search, method: 'POST', headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) } }, (res) => {
+            if (res.statusCode >= 400) console.error(`  [Teams] Alert failed: ${res.statusCode}`);
+            else console.log(`  [Teams] Alert sent: ${title}`);
+            res.resume();
+        });
+        req.on('error', e => console.error(`  [Teams] Error: ${e.message}`));
+        req.write(body);
+        req.end();
+    } catch (e) { console.error(`  [Teams] Invalid webhook URL: ${e.message}`); }
+}
+
+// ---------- Sprint History ----------
+function saveSprintSnapshot(sprint, summary, advanced, projectKey, teamName) {
+    const key = `${projectKey}_${teamName}`;
+    const today = new Date().toISOString().split('T')[0];
+    const snapshot = {
+        sprintName: sprint.name,
+        date: today,
+        totalPoints: summary.totalPoints,
+        completedPoints: summary.completedPoints,
+        completionPct: summary.completionPct,
+        velocity: advanced.forecast.dailyVelocity,
+        scopeCreepPct: advanced.scopeCreep.pctOfSprint,
+        agingItems: advanced.agingWIP.length,
+        carryOver: advanced.carryOverRisk.length,
+        focusFactor: advanced.focusFactor,
+        grade: advanced.scoreCard.grade,
+    };
+
+    let history = {};
+    try { history = JSON.parse(fs.readFileSync(HISTORY_FILE, 'utf-8')); } catch (e) { /* file doesn't exist yet */ }
+
+    if (!history[key]) history[key] = [];
+
+    // Deduplicate: update if same sprint+date exists
+    const idx = history[key].findIndex(h => h.sprintName === sprint.name && h.date === today);
+    if (idx >= 0) history[key][idx] = snapshot;
+    else history[key].push(snapshot);
+
+    // Keep last 100 entries max
+    if (history[key].length > 100) history[key] = history[key].slice(-100);
+
+    try {
+        fs.mkdirSync(path.dirname(HISTORY_FILE), { recursive: true });
+        fs.writeFileSync(HISTORY_FILE, JSON.stringify(history, null, 2));
+    } catch (e) { console.error(`  [History] Save failed: ${e.message}`); }
+}
+
+function getSprintHistory(projectKey, teamName) {
+    const key = `${projectKey}_${teamName}`;
+    try {
+        const history = JSON.parse(fs.readFileSync(HISTORY_FILE, 'utf-8'));
+        return history[key] || [];
+    } catch (e) { return []; }
+}
+
 // ---------- Server State ----------
 let boardId = null;
 let sprintData = null;
@@ -824,12 +945,23 @@ const server = http.createServer(async (req, res) => {
             const aiForecastInsight = aiAnalysis && typeof aiAnalysis.forecastInsight === 'string' ? aiAnalysis.forecastInsight : null;
             const aiRiskSummary = aiAnalysis && typeof aiAnalysis.riskSummary === 'string' ? aiAnalysis.riskSummary : null;
 
+            // Teams notifications (fire-and-forget)
+            const sprintMeta = { id: sprint.id, name: sprint.name, teamName, projectKey };
+            evaluateAndNotify(summary, advanced, sprintMeta);
+
+            // Save sprint snapshot for history
+            saveSprintSnapshot(sprint, summary, advanced, projectKey, teamName);
+
+            // Get history for comparison
+            const history = getSprintHistory(projectKey, teamName);
+
             sendJSON(res, {
                 sprint: { id: sprint.id, name: sprint.name, state: sprint.state, startDate: sprint.startDate, endDate: sprint.endDate, teamName, projectKey },
                 summary,
                 health,
                 issues,
                 advanced,
+                history,
                 ai: {
                     enabled: !!GITHUB_TOKEN,
                     sprintInsight: aiSprintInsight,
@@ -841,9 +973,19 @@ const server = http.createServer(async (req, res) => {
             return;
         }
 
+        // Sprint history endpoint
+        if (pathname === '/api/history') {
+            const projectKey = query.project || PROJECT_KEY;
+            const teamName = query.team || TEAM_NAME;
+            const history = getSprintHistory(projectKey, teamName);
+            sendJSON(res, { history });
+            return;
+        }
+
         if (pathname === '/api/refresh' && req.method === 'POST') {
             clearCache();
-            sendJSON(res, { status: 'cache cleared' });
+            firedAlerts.clear();
+            sendJSON(res, { status: 'cache cleared, alerts reset' });
             return;
         }
 
@@ -869,6 +1011,7 @@ console.log(`  Team:    ${TEAM_NAME}`);
 console.log(`  JIRA:    ${JIRA_BASE_URL}`);
 console.log(`  User:    ${USERNAME}`);
 console.log(`  AI Risk: ${GITHUB_TOKEN ? 'Enabled (GitHub Models GPT-4o)' : 'Disabled (set GITHUB_TOKEN to enable)'}`);
+console.log(`  Teams:   ${TEAMS_WEBHOOK_URL ? 'Enabled' : 'Disabled (set TEAMS_WEBHOOK_URL to enable)'}`);
 
 // Start server immediately - don't block on JIRA
 server.listen(PORT, '0.0.0.0', () => {

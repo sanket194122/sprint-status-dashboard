@@ -694,6 +694,13 @@
                 </div>
             </div>
 
+            <!-- Sprint Trends -->
+            <div class="table-section animate-in" id="trendsSection" style="margin-bottom:12px;">
+                <div class="table-title">Sprint Trends</div>
+                <div style="font-size:11px;color:var(--text-tertiary);margin-bottom:14px;">Historical comparison across sprints. Shows velocity and delivery trends over time.</div>
+                <div id="trendsContent" style="font-size:12px;color:var(--text-tertiary);">No history yet — data builds over time.</div>
+            </div>
+
             <!-- AI Retro Preview -->
             <div class="table-section animate-in" id="aiRetroSection" style="display:none;margin-bottom:32px;">
                 <div class="table-title">AI Sprint Retrospective Preview <span class="ai-tag">AI Generated</span></div>
@@ -821,12 +828,12 @@
             document.getElementById('loading').style.display = 'block'; document.getElementById('dashboard').style.display = 'none';
             startLoadingMessages();
             const params = new URLSearchParams(); if (currentProject) params.set('project', currentProject); if (currentTeam) params.set('team', currentTeam); if (currentSprint) params.set('sprint', currentSprint);
-            try { const d = await fetchJSON(`/api/all?${params}`); stopLoadingMessages(); render(d.sprint, d.summary, d.health, d.issues, d.ai, d.advanced); }
+            try { const d = await fetchJSON(`/api/all?${params}`); stopLoadingMessages(); render(d.sprint, d.summary, d.health, d.issues, d.ai, d.advanced, d.history); }
             catch(e) { stopLoadingMessages(); document.getElementById('loading').innerHTML = `<p style="color:var(--danger)">${e.message}</p><button class="sel-btn" onclick="fetchAll()" style="margin-top:16px">Retry</button>`; }
         }
 
         // Render
-        function render(sprint, summary, health, issues, ai, advanced) {
+        function render(sprint, summary, health, issues, ai, advanced, history) {
             allIssues = issues || [];
             document.getElementById('loading').style.display = 'none'; document.getElementById('dashboard').style.display = 'block';
 
@@ -878,6 +885,8 @@
 
             // Advanced metrics
             if (advanced) renderAdvanced(advanced, ai);
+            // Sprint history trends
+            if (history && history.length > 1) renderTrends(history);
         }
 
         function renderDonut(s) {
@@ -917,6 +926,50 @@
             }).join('');
         }
         function toggleDetail(i) { document.getElementById(`md-${i}`).classList.toggle('open'); }
+
+        function renderTrends(history) {
+            // Group by sprint name, get latest entry per sprint
+            const sprintMap = {};
+            history.forEach(h => {
+                if (!sprintMap[h.sprintName] || h.date > sprintMap[h.sprintName].date) sprintMap[h.sprintName] = h;
+            });
+            const sprints = Object.values(sprintMap).sort((a, b) => a.date.localeCompare(b.date)).slice(-5);
+            if (sprints.length < 2) { document.getElementById('trendsContent').textContent = 'Need at least 2 sprints for comparison.'; return; }
+
+            const current = sprints[sprints.length - 1];
+            const previous = sprints[sprints.length - 2];
+
+            function trend(curr, prev) {
+                if (curr > prev) return '<span style="color:var(--success)">&#9650;</span>';
+                if (curr < prev) return '<span style="color:var(--danger)">&#9660;</span>';
+                return '<span style="color:var(--text-tertiary)">&#9654;</span>';
+            }
+
+            const html = `
+                <div style="display:grid;grid-template-columns:1fr 1fr;gap:20px;">
+                    <div>
+                        <div style="font-size:11px;font-weight:600;color:var(--text-tertiary);margin-bottom:10px;text-transform:uppercase;letter-spacing:0.5px;">Velocity Trend (last ${sprints.length} sprints)</div>
+                        <div style="display:flex;align-items:flex-end;gap:4px;height:48px;">
+                            ${sprints.map(s => `<div style="flex:1;background:linear-gradient(180deg,var(--accent),var(--accent-secondary));border-radius:4px 4px 0 0;height:${Math.max((s.velocity / Math.max(...sprints.map(x=>x.velocity),1)) * 100, 8)}%;opacity:0.6;transition:opacity 0.2s;" title="${s.sprintName}: ${s.velocity} pts/day"></div>`).join('')}
+                        </div>
+                        <div style="display:flex;gap:4px;margin-top:4px;">
+                            ${sprints.map(s => `<div style="flex:1;font-size:9px;color:var(--text-tertiary);text-align:center;">${s.velocity}</div>`).join('')}
+                        </div>
+                    </div>
+                    <div>
+                        <div style="font-size:11px;font-weight:600;color:var(--text-tertiary);margin-bottom:10px;text-transform:uppercase;letter-spacing:0.5px;">Current vs Previous Sprint</div>
+                        <table style="font-size:12px;">
+                            <tr><td style="padding:4px 8px;color:var(--text-tertiary);">Metric</td><td style="padding:4px 8px;font-weight:600;">${previous.sprintName.substring(0,12)}</td><td style="padding:4px 8px;font-weight:600;">${current.sprintName.substring(0,12)}</td><td></td></tr>
+                            <tr><td style="padding:4px 8px;color:var(--text-tertiary);">Velocity</td><td style="padding:4px 8px;">${previous.velocity}</td><td style="padding:4px 8px;">${current.velocity}</td><td>${trend(current.velocity, previous.velocity)}</td></tr>
+                            <tr><td style="padding:4px 8px;color:var(--text-tertiary);">Delivery %</td><td style="padding:4px 8px;">${previous.completionPct}%</td><td style="padding:4px 8px;">${current.completionPct}%</td><td>${trend(current.completionPct, previous.completionPct)}</td></tr>
+                            <tr><td style="padding:4px 8px;color:var(--text-tertiary);">Scope Creep</td><td style="padding:4px 8px;">${previous.scopeCreepPct}%</td><td style="padding:4px 8px;">${current.scopeCreepPct}%</td><td>${trend(previous.scopeCreepPct, current.scopeCreepPct)}</td></tr>
+                            <tr><td style="padding:4px 8px;color:var(--text-tertiary);">Carry-Over</td><td style="padding:4px 8px;">${previous.carryOver}</td><td style="padding:4px 8px;">${current.carryOver}</td><td>${trend(previous.carryOver, current.carryOver)}</td></tr>
+                            <tr><td style="padding:4px 8px;color:var(--text-tertiary);">Focus Factor</td><td style="padding:4px 8px;">${previous.focusFactor}%</td><td style="padding:4px 8px;">${current.focusFactor}%</td><td>${trend(current.focusFactor, previous.focusFactor)}</td></tr>
+                        </table>
+                    </div>
+                </div>`;
+            document.getElementById('trendsContent').innerHTML = html;
+        }
 
         function renderAdvanced(adv, ai) {
             // Forecast (#2)
